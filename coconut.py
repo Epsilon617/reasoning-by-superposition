@@ -29,12 +29,64 @@ class Coconut(nn.Module):
         self.eos_token_id = eos_token_id
         self.start_latent_id = start_latent_id
         self.end_latent_id = end_latent_id
+        self.thought_perturber = None
+        self.capture_thoughts = False
+        self.captured_thoughts = []
+        self.kv_cache_policy = "full"
 
         # tested with GPT2 and Llama3
         if isinstance(self.base_causallm, GPT2LMHeadModel):
             self.embedding = self.base_causallm.transformer.get_input_embeddings()
         else:
             self.embedding = self.base_causallm.get_input_embeddings()
+
+    def reset_thought_trace(self):
+        self.captured_thoughts = []
+
+    def _capture_thought(self, thought):
+        if self.capture_thoughts:
+            self.captured_thoughts.append(thought.detach().cpu())
+
+    def _perturb_thought(self, thought, pass_idx, max_n_latents, batch_idx, token_idx):
+        if self.thought_perturber is None:
+            return thought
+        return self.thought_perturber(
+            thought,
+            pass_idx=pass_idx,
+            max_n_latents=max_n_latents,
+            batch_idx=batch_idx,
+            token_idx=token_idx,
+        )
+
+    def _past_key_values_for_range(self, kv_cache, past_end, keep_start=0):
+        return [
+            (
+                k[:, :, keep_start:past_end, :],
+                v[:, :, keep_start:past_end, :],
+            )
+            for k, v in kv_cache
+        ]
+
+    def _attention_mask_for_range(self, attention_mask, range_start, range_end, keep_start=0):
+        if keep_start == 0:
+            return attention_mask[:, :range_end]
+        return torch.cat(
+            [
+                attention_mask[:, keep_start:range_start],
+                attention_mask[:, range_start:range_end],
+            ],
+            dim=1,
+        )
+
+    def _kv_keep_start(self, latent_start):
+        if self.kv_cache_policy == "full":
+            return 0
+        if self.kv_cache_policy == "latent_only":
+            return latent_start
+        if self.kv_cache_policy.startswith("prompt_last_"):
+            n_prompt_tokens = int(self.kv_cache_policy.removeprefix("prompt_last_"))
+            return max(0, latent_start - n_prompt_tokens)
+        raise ValueError(f"Unknown kv_cache_policy: {self.kv_cache_policy}")
 
     def forward(self, input_ids, attention_mask, labels, position_ids, **kwargs):
 
@@ -56,7 +108,10 @@ class Coconut(nn.Module):
 
         if max_n_latents > 0:
             next_compute_range = (0, latent_indices[:, 1].min().item())
+            latent_start = next_compute_range[1]
             # before the earliest latent token position
+        else:
+            latent_start = 0
 
         kv_cache = None
 
@@ -79,33 +134,33 @@ class Coconut(nn.Module):
                 hidden_states_offset = 0
 
             else:
-                # extract kv cache to reuse
-                past_key_values = [
-                    (
-                        k[:, :, : next_compute_range[0], :],
-                        v[:, :, : next_compute_range[0], :],
-                    )
-                    for k, v in kv_cache
-                ]
-
+                keep_start = self._kv_keep_start(latent_start)
+                past_key_values = self._past_key_values_for_range(
+                    kv_cache, next_compute_range[0], keep_start=keep_start
+                )
                 outputs = self.base_causallm(
                     inputs_embeds=inputs_embeds[
                         :, next_compute_range[0] : next_compute_range[1], :
                     ],
-                    attention_mask=attention_mask[:, : next_compute_range[1]],
+                    attention_mask=self._attention_mask_for_range(
+                        attention_mask,
+                        next_compute_range[0],
+                        next_compute_range[1],
+                        keep_start=keep_start,
+                    ),
                     position_ids=position_ids[
                         :, next_compute_range[0] : next_compute_range[1]
                     ],
                     past_key_values=past_key_values,
                     output_hidden_states=True,
                 )
-
                 hidden_states_offset = next_compute_range[0]
-                # when we use kv_cache for the first k tokens
-                # in `outputs.hidden_states`, [0, k) will be skipped
-                # so we need to keep this offset to correctly use the last hidden states
+                logits.append(outputs.logits)
+                # when we use kv_cache for previous tokens, those tokens are skipped
+                # in `outputs.hidden_states`, so we keep this offset to index thoughts
 
-            logits.append(outputs.logits)
+            if kv_cache == None:
+                logits.append(outputs.logits)
 
             next_compute_range = (
                 next_compute_range[1],
@@ -145,9 +200,17 @@ class Coconut(nn.Module):
                 batch_idx, token_idx = idx_pair
 
                 # replace it with the preceding last hidden states
-                tensor_list[batch_idx][token_idx] = hidden_states[
+                thought = hidden_states[
                     batch_idx, token_idx - 1 - hidden_states_offset, :
                 ]
+                self._capture_thought(thought)
+                tensor_list[batch_idx][token_idx] = self._perturb_thought(
+                    thought,
+                    pass_idx=pass_idx,
+                    max_n_latents=max_n_latents,
+                    batch_idx=batch_idx,
+                    token_idx=token_idx,
+                )
 
             # assemble the new inputs_embeds
             inputs_embeds = torch.stack(
@@ -158,27 +221,46 @@ class Coconut(nn.Module):
             )
 
         # final pass
-        outputs = self.base_causallm(
-            inputs_embeds=inputs_embeds[
-                :, next_compute_range[0] : next_compute_range[1], :
-            ],
-            attention_mask=attention_mask[:, : next_compute_range[1]],
-            position_ids=position_ids[:, next_compute_range[0] : next_compute_range[1]],
-            past_key_values=(
-                [
-                    (
-                        k[:, :, : next_compute_range[0], :],
-                        v[:, :, : next_compute_range[0], :],
+        if not kv_cache:
+            outputs = self.base_causallm(
+                inputs_embeds=inputs_embeds[
+                    :, next_compute_range[0] : next_compute_range[1], :
+                ],
+                attention_mask=attention_mask[:, : next_compute_range[1]],
+                position_ids=position_ids[
+                    :, next_compute_range[0] : next_compute_range[1]
+                ],
+                past_key_values=(
+                    self._past_key_values_for_range(
+                        kv_cache, next_compute_range[0], keep_start=0
                     )
-                    for k, v in kv_cache
-                ]
-                if kv_cache
-                else None
-            ),
-            output_hidden_states=True,
-        )
-
-        logits.append(outputs.logits)
+                    if kv_cache
+                    else None
+                ),
+                output_hidden_states=True,
+            )
+            logits.append(outputs.logits)
+        else:
+            keep_start = self._kv_keep_start(latent_start)
+            outputs = self.base_causallm(
+                inputs_embeds=inputs_embeds[
+                    :, next_compute_range[0] : next_compute_range[1], :
+                ],
+                attention_mask=self._attention_mask_for_range(
+                    attention_mask,
+                    next_compute_range[0],
+                    next_compute_range[1],
+                    keep_start=keep_start,
+                ),
+                position_ids=position_ids[
+                    :, next_compute_range[0] : next_compute_range[1]
+                ],
+                past_key_values=self._past_key_values_for_range(
+                    kv_cache, next_compute_range[0], keep_start=keep_start
+                ),
+                output_hidden_states=True,
+            )
+            logits.append(outputs.logits)
 
         self.gen_forward_cnt += max_n_latents + 1
 

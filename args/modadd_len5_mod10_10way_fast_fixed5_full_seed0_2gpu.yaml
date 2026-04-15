@@ -1,0 +1,38 @@
+project: coconut
+save_path: ckpts_modadd
+name: "modadd-len5-mod10-10way-fixed5-full-seed0-2gpu-20260415"
+
+only_eval: False
+
+coconut: True
+cot: False
+no_thoughts: False
+no_cot: False
+
+c_thought: 1
+epochs_per_stage: 25
+max_latent_stage: 5
+fixed_latent_stage: 5
+pad_latent_to_max: True
+
+save_only_improve: False
+uniform_prob: 0.0
+model_id: configs/symbol-2layer-8head-768dim.json
+load_model_path: None
+seed: 0
+resume: 0
+bf16: False
+train_path: data/modadd_len5_mod10_10way_fast_train.json
+val_path: data/modadd_len5_mod10_10way_fast_valid.json
+reset_optimizer: False
+batch_size_training: 64
+debug: False
+gradient_accumulation_steps: 1
+num_epochs: 120
+lr: !!float "1e-4"
+weight_decay: 0.01
+
+disable_wandb: False
+save_every_epochs: 5
+eval_loss_every_epochs: 5
+gen_eval_every_epochs: 5

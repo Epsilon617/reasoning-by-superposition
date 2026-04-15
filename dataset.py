@@ -133,6 +133,13 @@ def expand_data(data, k, max_steps, neg_sampling=False):
     for i, s in enumerate(data['idx_to_symbol']):
         symbol_to_idx[s] = i
     
+    def get_choice_text(data):
+        if "choices" in data:
+            return " ".join(str(choice) for choice in data["choices"])
+        if random.random() < 0.5:
+            return str(data["target"]) + " " + str(data["neg_target"])
+        return str(data["neg_target"]) + " " + str(data["target"])
+
     def get_prefix(data):
         
         random.shuffle(data['edges'])
@@ -140,10 +147,7 @@ def expand_data(data, k, max_steps, neg_sampling=False):
         question = "<eos> " + "|".join([f" {e[0]} {e[1]} " for e in data['edges']]).strip() + \
             " [Q] "
 
-        if random.random() < 0.5:
-            question += str(data['target']) + " " + str(data['neg_target'])
-        else:
-            question += str(data['neg_target']) + " " + str(data['target'])
+        question += get_choice_text(data)
 
         question += " [R] " + str(data['root'])
         
@@ -306,6 +310,17 @@ def get_graph_latent_question_dataset(
         dist.broadcast_object_list(processed_dataset, src=0)
         dataset = processed_dataset[0]
 
+    else:
+        # Process each sample and collect all results
+        all_processed_samples = []
+        for idx, sample in enumerate(base_dataset):
+            processed_samples = process_dataset(sample, idx)
+            all_processed_samples.extend(processed_samples)
+
+        processed_dataset = all_processed_samples
+        random.shuffle(processed_dataset)
+        dataset = processed_dataset
+
     return dataset
 
 def get_graph_cot_dataset(
@@ -329,8 +344,9 @@ def get_graph_cot_dataset(
         # Construct the question part
         question = "<eos> " + "|".join([f" {e[0]} {e[1]} " for e in sample['edges']]).strip() + " [Q] "
         
-        # Randomly order target and neg_target in the question
-        if random.random() < 0.5:
+        if "choices" in sample:
+            question += " ".join(str(choice) for choice in sample["choices"])
+        elif random.random() < 0.5:
             question += f"{sample['target']} {sample['neg_target']}"
         else:
             question += f"{sample['neg_target']} {sample['target']}"
@@ -415,8 +431,9 @@ def get_graph_no_cot_dataset(
         # Construct the question part
         question = "<eos> " + "|".join([f" {e[0]} {e[1]} " for e in sample['edges']]).strip() + " [Q] "
         
-        # Randomly order target and neg_target in the question
-        if random.random() < 0.5:
+        if "choices" in sample:
+            question += " ".join(str(choice) for choice in sample["choices"])
+        elif random.random() < 0.5:
             question += f"{sample['target']} {sample['neg_target']}"
         else:
             question += f"{sample['neg_target']} {sample['target']}"
@@ -487,8 +504,9 @@ def get_graph_no_latent_question_dataset(
         random.shuffle(sample['edges'])
         question = "<eos> " + "|".join([f" {e[0]} {e[1]} " for e in sample['edges']]).strip() + " [Q] "
         
-        # Randomly order target and neg_target in the question
-        if random.random() < 0.5:
+        if "choices" in sample:
+            question += " ".join(str(choice) for choice in sample["choices"])
+        elif random.random() < 0.5:
             question += f"{sample['target']} {sample['neg_target']}"
         else:
             question += f"{sample['neg_target']} {sample['target']}"
