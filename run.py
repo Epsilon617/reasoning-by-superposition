@@ -36,6 +36,25 @@ import argparse
 import functools
 from utils import Config, set_seed
 
+
+def get_config_value(configs, key, default):
+    return getattr(configs, key, default)
+
+
+def unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def maybe_barrier(world_size):
+    if world_size > 1:
+        dist.barrier()
+
+
+def maybe_all_reduce(tensor, world_size):
+    if world_size > 1:
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+
+
 def main():
     parser = argparse.ArgumentParser(description="coconut")
     parser.add_argument("config_file")
@@ -57,11 +76,19 @@ def main():
     configs = Config(config_dict)
     set_seed(configs.seed)
     save_dir = os.path.join(configs.save_path, configs.name)
+    save_every_epochs = max(1, int(get_config_value(configs, "save_every_epochs", 1)))
+    eval_loss_every_epochs = max(
+        1, int(get_config_value(configs, "eval_loss_every_epochs", 1))
+    )
+    gen_eval_every_epochs = max(
+        1, int(get_config_value(configs, "gen_eval_every_epochs", 1))
+    )
+    disable_wandb = bool(get_config_value(configs, "disable_wandb", False))
 
     if not os.path.exists(save_dir) and rank == 0:
         os.makedirs(save_dir)
 
-    torch.distributed.barrier()
+    maybe_barrier(world_size)
     cur_ckpts = os.listdir(save_dir)
 
     # check if the job is preempted and resumed.
@@ -148,6 +175,7 @@ def main():
 
     if configs.coconut:
         model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id)
+        model.kv_cache_policy = get_config_value(configs, "kv_cache_policy", "full")
 
     if configs.load_model_path != "None" and not loaded:
         print(model.load_state_dict(saved_weights, strict=False))
@@ -166,10 +194,11 @@ def main():
     if configs.bf16:
         model.to(torch.bfloat16)
 
-    # if only eval, use ddp (to avoid bugs in fsdp)
-    if configs.only_eval:
+    # Single-GPU runs do not benefit from FSDP(NO_SHARD) and pay wrapper overhead.
+    if world_size == 1:
+        parallel_model = model
+    elif configs.only_eval:
         parallel_model = DDP(model, device_ids=[rank])
-
     else:
         parallel_model = FSDP(
             model, auto_wrap_policy=llama_auto_wrap_policy, device_id=rank
@@ -191,7 +220,7 @@ def main():
 
     total_train_steps = 0
 
-    if not configs.debug and not configs.only_eval and rank == 0:
+    if not configs.debug and not configs.only_eval and not disable_wandb and rank == 0:
         wandb_run = wandb.init(project=configs.project, name=configs.name)
         wandb_run.config.update(configs, allow_val_change=True)
         text_table = wandb.Table(columns=["step", "text"])
@@ -205,19 +234,41 @@ def main():
         lr=configs.lr,
         weight_decay=configs.weight_decay,
     )
+    inner_model = unwrap_model(parallel_model)
 
     best_acc = 0
 
     collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
 
     for epoch in range(configs.resume, configs.num_epochs):
+        epoch_num = epoch + 1
+        is_last_epoch = epoch_num == configs.num_epochs
+        should_run_loss_eval = (
+            is_last_epoch or epoch_num % eval_loss_every_epochs == 0
+        )
+        should_run_gen_eval = (
+            configs.only_eval
+            or configs.save_only_improve
+            or is_last_epoch
+            or epoch_num % gen_eval_every_epochs == 0
+        )
+        should_save_regular = (
+            is_last_epoch or epoch_num % save_every_epochs == 0
+        )
         
+        fixed_latent_stage = get_config_value(configs, "fixed_latent_stage", None)
         scheduled_stage = (
-            0 if (configs.cot or configs.no_cot) else epoch // configs.epochs_per_stage
+            0
+            if (configs.cot or configs.no_cot)
+            else (
+                int(fixed_latent_stage)
+                if fixed_latent_stage is not None
+                else epoch // configs.epochs_per_stage
+            )
         )
         print("scheduled_stage", scheduled_stage)
-        
-        if True:
+
+        if should_run_gen_eval:
             if configs.cot or configs.no_cot:
                 dataset_gen_val = get_graph_no_latent_question_dataset(
                     configs.val_path,
@@ -274,35 +325,36 @@ def main():
 
             # the sampler is deterministic even if shuffle is set to True
             # so we have shuffled the dataset when it's constructed (at every epoch).
-            if configs.cot:
-                dataset_loss_val = get_graph_cot_dataset(
-                    configs.val_path,
-                    configs,
-                    tokenizer,
-                )
-            elif configs.no_cot:
-                dataset_loss_val = get_graph_no_cot_dataset(
-                    configs.val_path,
-                    configs,
-                    tokenizer,
-                )
-            else:
-                dataset_loss_val = get_graph_latent_cot_dataset(
-                    configs.val_path,
-                    scheduled_stage,
-                    configs,
-                    tokenizer,
-                )
+            if should_run_loss_eval:
+                if configs.cot:
+                    dataset_loss_val = get_graph_cot_dataset(
+                        configs.val_path,
+                        configs,
+                        tokenizer,
+                    )
+                elif configs.no_cot:
+                    dataset_loss_val = get_graph_no_cot_dataset(
+                        configs.val_path,
+                        configs,
+                        tokenizer,
+                    )
+                else:
+                    dataset_loss_val = get_graph_latent_cot_dataset(
+                        configs.val_path,
+                        scheduled_stage,
+                        configs,
+                        tokenizer,
+                    )
 
-            valid_loss_dataloader = torch.utils.data.DataLoader(
-                dataset_loss_val,
-                num_workers=1,
-                shuffle=False,
-                pin_memory=True,
-                batch_size=configs.batch_size_training,
-                collate_fn=collator,
-                sampler=DistributedSampler(dataset_loss_val, shuffle=False),
-            )
+                valid_loss_dataloader = torch.utils.data.DataLoader(
+                    dataset_loss_val,
+                    num_workers=1,
+                    shuffle=False,
+                    pin_memory=True,
+                    batch_size=configs.batch_size_training,
+                    collate_fn=collator,
+                    sampler=DistributedSampler(dataset_loss_val, shuffle=False),
+                )
 
             if configs.reset_optimizer and scheduled_stage < configs.max_latent_stage:
                 del optimizer
@@ -313,7 +365,7 @@ def main():
                     weight_decay=configs.weight_decay,
                 )
 
-            parallel_model.module.train()
+            inner_model.train()
 
             total_length = len(train_dataloader) // configs.gradient_accumulation_steps
             pbar = tqdm(
@@ -321,6 +373,7 @@ def main():
                 desc=f"Training Epoch: {epoch+1}",
                 total=total_length,
                 dynamic_ncols=True,
+                disable=not sys.stderr.isatty(),
             )
 
             for step, batch in enumerate(train_dataloader):
@@ -379,60 +432,72 @@ def main():
                     wandb_run.log(log_dict)
 
                 pbar.set_description(
-                    f"Training Epoch: {epoch+1}/{configs.num_epochs}, batch {step}/{len(train_dataloader)} "
+                    f"Training Epoch: {epoch_num}/{configs.num_epochs}, batch {step}/{len(train_dataloader)} "
                     f"completed (loss: {round(float(loss.detach().float() * configs.gradient_accumulation_steps), 4)}"
                 )
             pbar.close()
-            dist.barrier()
+            maybe_barrier(world_size)
 
             if (
                 not configs.save_only_improve
                 and not configs.debug
                 and not configs.only_eval
+                and should_save_regular
             ):
                 states = parallel_model.state_dict()
                 if rank == 0:
                     torch.save(
-                        states, os.path.join(save_dir, f"checkpoint_{epoch + 1}")
+                        states, os.path.join(save_dir, f"checkpoint_{epoch_num}")
                     )
                     print("saving model.")
 
-                dist.barrier()
+                maybe_barrier(world_size)
                 del states
                 gc.collect()
                 torch.cuda.empty_cache()
 
             # val loss
-            total_loss = 0
+            if should_run_loss_eval:
+                total_loss = 0
 
-            with torch.no_grad():
-                parallel_model.module.eval()
-                for step, batch in enumerate(valid_loss_dataloader):
+                with torch.no_grad():
+                    inner_model.eval()
+                    for step, batch in enumerate(valid_loss_dataloader):
 
-                    batch = {
-                        key: batch[key].to(rank) for key in batch.keys() if key != "idx"
-                    }
+                        batch = {
+                            key: batch[key].to(rank) for key in batch.keys() if key != "idx"
+                        }
 
-                    outputs = parallel_model(**batch)
-                    loss = outputs.loss
-                    dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-                    total_loss += loss.item() / world_size
+                        outputs = parallel_model(**batch)
+                        loss = outputs.loss
+                        maybe_all_reduce(loss, world_size)
+                        total_loss += loss.item() / world_size
 
-                if wandb_run and rank == 0:
+                    if wandb_run and rank == 0:
 
-                    log_dict = {
-                        "eval/loss": total_loss / len(valid_loss_dataloader),
-                    }
-                    wandb_run.log(log_dict)
-                    print("eval loss", total_loss / len(valid_loss_dataloader))
+                        log_dict = {
+                            "eval/loss": total_loss / len(valid_loss_dataloader),
+                        }
+                        wandb_run.log(log_dict)
+                    if rank == 0:
+                        print("eval loss", total_loss / len(valid_loss_dataloader))
+            elif rank == 0:
+                print(
+                    f"Skipping validation loss at epoch {epoch_num}; "
+                    f"next loss eval every {eval_loss_every_epochs} epochs"
+                )
 
         # if scheduled_stage >= configs.max_latent_stage:
-        if True:
+        if should_run_gen_eval:
             # val generation accuracy
             total_length = len(valid_gen_dataloader)
 
             pbar = tqdm(
-                colour="blue", desc=f"Test Accuracy", total=total_length, dynamic_ncols=True
+                colour="blue",
+                desc=f"Test Accuracy",
+                total=total_length,
+                dynamic_ncols=True,
+                disable=not sys.stderr.isatty(),
             )
             cor, cor_cot, total = (
                 torch.tensor(0, device=rank),
@@ -441,7 +506,7 @@ def main():
             )
 
             with torch.no_grad():
-                parallel_model.module.eval()
+                inner_model.eval()
                 for idx, batch in enumerate(valid_gen_dataloader):
                     test_idx = batch["idx"][0]
 
@@ -461,21 +526,21 @@ def main():
 
                     # synced_gpus=True in FSDP mode, as we need to keep # forward pass the same on each device
                     if configs.cot:
-                        outputs = parallel_model.module.generate(
+                        outputs = inner_model.generate(
                             **batch,
                             max_new_tokens=64,
                             synced_gpus=not configs.only_eval,
                             eos_token_id=tokenizer.eos_token_id,
                         )
                     elif configs.no_cot:
-                        outputs = parallel_model.module.generate(
+                        outputs = inner_model.generate(
                             **batch,
                             max_new_tokens=64,
                             synced_gpus=not configs.only_eval,
                             eos_token_id=tokenizer.eos_token_id,
                         )
                     else:
-                        outputs = parallel_model.module.generate(
+                        outputs = inner_model.generate(
                             **batch,
                         max_new_tokens=1,
                         synced_gpus=not configs.only_eval,
@@ -507,9 +572,9 @@ def main():
                 pbar.close()
                 print(f"Device {rank}: Cor={cor}, Total={total}")
 
-            dist.all_reduce(cor_cot, op=dist.ReduceOp.SUM)
-            dist.all_reduce(cor, op=dist.ReduceOp.SUM)
-            dist.all_reduce(total, op=dist.ReduceOp.SUM)
+            maybe_all_reduce(cor_cot, world_size)
+            maybe_all_reduce(cor, world_size)
+            maybe_all_reduce(total, world_size)
 
             # cor_cot = cor_cot.item()
             cor = cor.item()
@@ -525,7 +590,7 @@ def main():
             if configs.only_eval:
                 break
 
-            dist.barrier()
+            maybe_barrier(world_size)
             if (
                 cor / total > best_acc
                 and configs.save_only_improve
@@ -535,15 +600,20 @@ def main():
                 states = parallel_model.state_dict()
 
                 if rank == 0:
-                    torch.save(states, os.path.join(save_dir, f"checkpoint_{epoch + 1}"))
+                    torch.save(states, os.path.join(save_dir, f"checkpoint_{epoch_num}"))
                     print("saving model.")
 
                 best_acc = cor / total
 
-                dist.barrier()
+                maybe_barrier(world_size)
                 del states
                 gc.collect()
                 torch.cuda.empty_cache()
+        elif rank == 0:
+            print(
+                f"Skipping generation eval at epoch {epoch_num}; "
+                f"next generation eval every {gen_eval_every_epochs} epochs"
+            )
 
 
 if __name__ == "__main__":
